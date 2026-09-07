@@ -1,0 +1,339 @@
+.LinkPreview-card-wrapper {
+    position: relative;
+    margin: 8px 0;
+}
+
+.LinkPreview-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin: 0;
+    padding: 12px;
+    border: 1px solid var(--control-bg);
+    border-radius: var(--border-radius);
+    background: var(--control-bg);
+    color: var(--text-color);
+    text-decoration: none;
+    overflow: hidden;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+
+    &,
+    &:hover,
+    &:focus,
+    &:active {
+        text-decoration: none;
+    }
+
+    &:hover,
+    &:focus {
+        background: var(--body-bg);
+        border-color: var(--muted-color);
+        color: var(--text-color);
+    }
+}
+
+// Desktop: compact square side-thumbnail (Slack/Discord style). A 1:1 crop
+// loses less of a 1.91:1 OG image than the old 4:3 slot did. `aspect-ratio`
+// keeps it square regardless of how the source scales.
+.LinkPreview-card-image {
+    flex: 0 0 auto;
+    width: 96px;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    border-radius: calc(var(--border-radius) * 0.5);
+    background: var(--body-bg);
+}
+
+// Failed-image placeholder: same dimensions, subtle gradient. Preserves the
+// slot so the card doesn't reflow when a hot-linked image 404s.
+.LinkPreview-card-image--missing {
+    background: linear-gradient(135deg, var(--body-bg) 25%, var(--control-bg) 25%, var(--control-bg) 50%, var(--body-bg) 50%, var(--body-bg) 75%, var(--control-bg) 75%);
+    background-size: 8px 8px;
+    opacity: 0.4;
+}
+
+// Pending-fetch skeleton — reserves the card's footprint (same thumbnail slot +
+// stacked text lines) so the real card, or its removal, doesn't shift content
+// below it. Inert: no hover state, no pointer events.
+.LinkPreview-card--skeleton {
+    cursor: default;
+
+    &:hover,
+    &:focus {
+        background: var(--control-bg);
+        border-color: var(--control-bg);
+    }
+}
+
+.LinkPreview-card-image--skeleton,
+.LinkPreview-skeleton-line {
+    background: linear-gradient(90deg, var(--control-bg) 25%, var(--body-bg) 37%, var(--control-bg) 63%);
+    background-size: 400% 100%;
+    animation: LinkPreview-shimmer 1.4s ease infinite;
+}
+
+.LinkPreview-skeleton-line {
+    height: 12px;
+    margin-bottom: 9px;
+    border-radius: calc(var(--border-radius) * 0.5);
+
+    // The first line stands in for the smaller uppercase site name.
+    &:first-child {
+        height: 9px;
+        margin-bottom: 11px;
+    }
+
+    &:last-child {
+        margin-bottom: 2px;
+    }
+}
+
+@keyframes LinkPreview-shimmer {
+    from { background-position: 100% 0; }
+    to { background-position: 0 0; }
+}
+
+// Respect reduced-motion: hold a static placeholder instead of shimmering.
+@media (prefers-reduced-motion: reduce) {
+    .LinkPreview-card-image--skeleton,
+    .LinkPreview-skeleton-line {
+        animation: none;
+    }
+}
+
+// Hide button — overlaid in top-right corner. Visible only to actors with
+// edit permission (UI gating); also gated server-side.
+.LinkPreview-card-dismiss {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: var(--body-bg);
+    color: var(--muted-color);
+    font-size: 16px;
+    line-height: 20px;
+    cursor: pointer;
+    opacity: 0.6;
+    transition: opacity 0.15s ease, background 0.15s ease;
+
+    &:hover, &:focus {
+        opacity: 1;
+        background: var(--alert-error-bg, #fee);
+        color: var(--alert-error-color, #c00);
+    }
+
+    &:disabled {
+        opacity: 0.3;
+        cursor: not-allowed;
+    }
+}
+
+// Hover preview overlay — singleton appended to <body>, positioned in page
+// coordinates next to the hovered link. Shown for links whose card is not
+// inline (titled links by default, dismissed raw links).
+.LinkPreview-hovercard {
+    position: absolute;
+    z-index: 9999;
+    width: 440px;
+    max-width: calc(100vw - 16px);
+    background: var(--body-bg);
+    border: 1px solid var(--control-bg);
+    border-radius: var(--border-radius);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+    overflow: hidden;
+    animation: LinkPreview-hovercard-in 0.12s ease-out;
+
+    .LinkPreview-card {
+        border: 0;
+        border-radius: 0;
+        background: var(--body-bg);
+
+        &:hover,
+        &:focus {
+            background: var(--control-bg);
+        }
+    }
+}
+
+@keyframes LinkPreview-hovercard-in {
+    from {
+        opacity: 0;
+        transform: translateY(2px);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+// Action row inside the overlay ("Show preview in post") — only rendered
+// for actors with edit permission on the post.
+.LinkPreview-hovercard-actions {
+    display: flex;
+    justify-content: flex-end;
+    padding: 6px 12px;
+    border-top: 1px solid var(--control-bg);
+}
+
+// Touch-device preview trigger — a small explicit tap target rendered after
+// links whose preview is hidden (no hover on touch; the link itself must
+// keep navigating on first tap).
+.LinkPreview-previewToggle {
+    background: none;
+    border: none;
+    padding: 0 6px;
+    margin-left: 2px;
+    color: var(--muted-color);
+    font-size: 0.85em;
+    cursor: pointer;
+    vertical-align: baseline;
+
+    &:hover,
+    &:focus {
+        color: var(--link-color);
+    }
+}
+
+.LinkPreview-hovercard-pin {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--link-color);
+    cursor: pointer;
+    font-size: 0.85em;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+
+    &:hover,
+    &:focus {
+        text-decoration-style: solid;
+    }
+
+    &:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+}
+
+.LinkPreview-card-text {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.LinkPreview-card-site {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted-color);
+    margin-bottom: 4px;
+}
+
+// The site mark in front of the site name: the forum share image on logo
+// self-links, the source page's own favicon everywhere else — the most compact
+// treatment, matching how Slack/Discord/iMessage show logo-only links.
+//
+// The slot, not the image, carries the size. A favicon that 404s or gets
+// blocked has its <img> removed and leaves this box standing, so the card's
+// text never reflows after paint.
+.LinkPreview-card-site-mark {
+    flex: 0 0 auto;
+    display: block;
+    width: 18px;
+    height: 18px;
+}
+
+.LinkPreview-card-site-favicon {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    border-radius: 3px;
+}
+
+// Fallback for the quarter of cards whose source offers no icon we can use —
+// none declared, all of them dead, or the only one too heavy to serve. A
+// letter chip costs no request and no bytes, so every card carries a mark
+// instead of some carrying a gap. The background colour is set inline from a
+// hash of the hostname, so a site always gets the same one.
+.LinkPreview-card-site-mark--monogram {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 3px;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+    // The site row is uppercased and letterspaced; a single glyph should be
+    // neither pushed off-centre by tracking nor re-transformed.
+    letter-spacing: 0;
+    text-transform: none;
+    font-style: normal;
+}
+
+.LinkPreview-card-title {
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--text-color);
+    margin-bottom: 4px;
+
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    line-clamp: 2;
+    overflow: hidden;
+}
+
+.LinkPreview-card-desc {
+    font-size: 0.9em;
+    line-height: 1.4;
+    color: var(--muted-color);
+
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    line-clamp: 3;
+    overflow: hidden;
+}
+
+@media (max-width: 480px) {
+    .LinkPreview-card {
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    // Mobile: full-width banner at the OG standard 1.91:1. Matching the source
+    // ratio means a 1200×630 og:image shows essentially uncropped, and the
+    // ratio is fixed rather than floating with the viewport width.
+    .LinkPreview-card-image {
+        width: 100%;
+        aspect-ratio: 1.91 / 1;
+    }
+
+    // ...but a square or portrait image cropped to 1.91:1 loses its top and
+    // bottom — a logo becomes an unreadable band. The class is added on load
+    // once the real aspect is known; `object-fit` is not a layout property, so
+    // the box keeps the size it already reserved and nothing shifts.
+    .LinkPreview-card-image--letterbox {
+        object-fit: contain;
+    }
+
+    // A picture the source declares as narrower than this banner would only be
+    // upscaled to fill it. Keep the desktop-style row instead: a small square
+    // thumbnail beside the text, which is what every messenger falls back to.
+    .LinkPreview-card--compact {
+        flex-direction: row;
+
+        .LinkPreview-card-image {
+            width: 72px;
+            aspect-ratio: 1 / 1;
+        }
+    }
+}
