@@ -1,0 +1,150 @@
+<?php
+
+use Ekumanov\LinkPreview\Api\Controller\DismissPreviewController;
+use Ekumanov\LinkPreview\Api\Controller\PinPreviewController;
+use Ekumanov\LinkPreview\Console\BackfillIconsCommand;
+use Ekumanov\LinkPreview\Console\BackfillPreviewsCommand;
+use Ekumanov\LinkPreview\Console\RefreshSelfLinksCommand;
+use Ekumanov\LinkPreview\Console\RetryFailedPreviewsCommand;
+use Ekumanov\LinkPreview\Console\SweepStuckPreviewsCommand;
+use Ekumanov\LinkPreview\Preview;
+use Ekumanov\LinkPreview\Listener\ScanPostUrls;
+use Ekumanov\LinkPreview\PostResourceFields;
+use Flarum\Api\Endpoint;
+use Flarum\Foundation\Paths;
+use Flarum\Http\UrlGenerator;
+use League\Flysystem\Visibility;
+use Flarum\Api\Resource;
+use Flarum\Extend;
+use Flarum\Post\Event\Posted;
+use Flarum\Post\Event\Revised;
+use Flarum\Post\Post;
+use Illuminate\Console\Scheduling\Event as ScheduleEvent;
+
+return [
+    (new Extend\Frontend('forum'))
+        ->js(__DIR__.'/js/dist/forum.js')
+        ->css(__DIR__.'/resources/less/forum.less'),
+
+    (new Extend\Frontend('admin'))
+        ->js(__DIR__.'/js/dist/admin.js'),
+
+    new Extend\Locales(__DIR__.'/locale'),
+
+    (new Extend\Model(Post::class))
+        ->relationship('linkPreviews', function (Post $post) {
+            return $post
+                ->belongsToMany(Preview::class, 'ekumanov_link_preview_post', 'post_id', 'preview_id')
+                ->withPivot('dismissed_at', 'pinned_at')
+                ->wherePivot('is_link', 1)
+                ->whereNull('error')
+                // Successfully fetched (http_status 200), OR still pending
+                // (retrieved_at NULL) — the front-end renders a fixed-size
+                // skeleton for pending rows so the card slot is reserved before
+                // the fetch lands. Hard failures (non-200 with a retrieved_at)
+                // stay excluded. `refresh_error` is deliberately NOT filtered
+                // on: it records a failed re-fetch of a row whose card is
+                // still good, and that card stays (see FetchPreviewJob).
+                ->where(fn ($q) => $q->where('http_status', 200)->orWhereNull('retrieved_at'));
+        }),
+
+    (new Extend\ApiResource(Resource\PostResource::class))
+        ->fields(PostResourceFields::class)
+        ->endpoint(
+            [Endpoint\Index::class, Endpoint\Show::class, Endpoint\Create::class, Endpoint\Update::class],
+            fn ($endpoint) => $endpoint->eagerLoad('linkPreviews')
+        ),
+
+    (new Extend\ApiResource(Resource\DiscussionResource::class))
+        ->endpoint(
+            [Endpoint\Show::class, Endpoint\Index::class],
+            fn ($endpoint) => $endpoint->eagerLoadWhenIncluded([
+                'posts' => ['posts.linkPreviews'],
+                'firstPost' => ['firstPost.linkPreviews'],
+                'lastPost' => ['lastPost.linkPreviews'],
+            ])
+        ),
+
+    // ─── Fetch pipeline ────────────────────────────────────────────────
+    //
+    // Bind interfaces to default implementations so the container can wire
+    // SafeHttpClient end-to-end. Tests instantiate the client directly with
+    // fakes; production code resolves via DI.
+
+    (new Extend\ServiceProvider())
+        ->register(\Ekumanov\LinkPreview\LinkPreviewServiceProvider::class),
+
+    // Site icons are served from here rather than hot-linked, so a reader's
+    // browser never contacts the domains a discussion links to. Filenames are
+    // the SHA-256 of the content, so the year-long cache header the assets
+    // directory already carries is safe: a changed icon is a different file.
+    (new Extend\Filesystem())
+        ->disk('ekumanov-link-preview-icons', function (Paths $paths, UrlGenerator $url) {
+            return [
+                'root' => "$paths->public/assets/link-preview-icons",
+                'url' => $url->to('forum')->path('assets/link-preview-icons'),
+                // Without this the local adapter creates the directory 0700,
+                // which on a normal install — CLI as one user, PHP-FPM as
+                // another — means whichever writes first locks the other out.
+                // If the CLI wins, the web server cannot read the files and
+                // every icon 404s silently. Core's own assets disk sets it too.
+                'visibility' => Visibility::PUBLIC,
+            ];
+        }),
+
+    // Permission: gate URL→preview scanning on the post author's group. Default
+    // grant covered by Extend\Policy/Permissions in stock Flarum — we just
+    // need to expose the key so admins can toggle it. Members are granted by
+    // the standard "members" group permission editor.
+
+    // Event hooks: scan and enqueue on every new/edited post.
+    (new Extend\Event())
+        ->listen(Posted::class, ScanPostUrls::class)
+        ->listen(Revised::class, ScanPostUrls::class),
+
+    // Per-(post, preview) display override: dismiss force-hides the inline
+    // card (link becomes hover-only), pin force-shows it (titled link gets
+    // a permanent card). Authors can do their own posts (within the edit
+    // window); mods/admins can do any. See controllers for the permission
+    // gate (single Gate::allows('edit', $post) check covers both).
+    (new Extend\Routes('api'))
+        ->post('/link-previews/posts/{postId}/previews/{previewId}/dismiss', 'link-preview.dismiss', DismissPreviewController::class)
+        ->post('/link-previews/posts/{postId}/previews/{previewId}/pin', 'link-preview.pin', PinPreviewController::class),
+
+    // Default settings — admins override via the admin settings page (v2.0+).
+    // Blacklist default is empty: every URL gets a fetch+card unless the
+    // admin explicitly excludes a host. Dismiss/restore controls give
+    // authors+mods per-card override on top of the host-level setting.
+    (new Extend\Settings())
+        ->default('ekumanov-link-preview.blacklist', '')
+        // One boolean for the whole forum, not a field per preview: the card
+        // falls back to a monogram when a site gives us no usable icon, and
+        // that is still a site mark — so the switch that hides icons has to
+        // hide it too. Absent means the code default (on), matching
+        // SettingsRepository::showFavicons().
+        ->serializeToForum(
+            'ekumanovLinkPreviewSiteMarks',
+            'ekumanov-link-preview.show_favicons',
+            fn ($value) => $value === null || $value === '' ? true : ((bool) $value && $value !== '0'),
+        ),
+
+    // Scheduler safety-net: every 5 min, re-dispatch any placeholder preview
+    // rows whose original FetchPreviewJob seems to have been dropped (worker
+    // restart, Redis flush, etc.). Also exposed as `php flarum link-preview:sweep`.
+    (new Extend\Console())
+        ->command(SweepStuckPreviewsCommand::class)
+        ->command(BackfillPreviewsCommand::class)
+        // One-off catch-up for rows that pre-date icon probing. Deliberately
+        // NOT scheduled — new rows get their probe inside FetchPreviewJob.
+        ->command(BackfillIconsCommand::class)
+        ->command(RefreshSelfLinksCommand::class)
+        ->command(RetryFailedPreviewsCommand::class)
+        ->schedule(SweepStuckPreviewsCommand::class, function (ScheduleEvent $event) {
+            $event->everyFiveMinutes()->withoutOverlapping();
+        })
+        // Hourly, but each row carries its own backoff (1h → 30d), so a site
+        // that keeps blocking us is not hit hourly — see FailurePolicy.
+        ->schedule(RetryFailedPreviewsCommand::class, function (ScheduleEvent $event) {
+            $event->hourly()->withoutOverlapping();
+        }),
+];
