@@ -1,0 +1,873 @@
+import app from 'flarum/forum/app';
+import { extend } from 'flarum/common/extend';
+import CommentPost from 'flarum/forum/components/CommentPost';
+import humanTime from 'flarum/common/utils/humanTime';
+
+const CARD_CLASS = 'LinkPreview-card';
+const WRAPPER_CLASS = 'LinkPreview-card-wrapper';
+const HOVER_CLASS = 'LinkPreview-hovercard';
+// Below this width:height an image is not a banner, and cropping it to one
+// costs more than letterboxing it. Matches the OG standard of 1.91:1 with a
+// little slack.
+const WIDE_RATIO = 1.5;
+const TOGGLE_CLASS = 'LinkPreview-previewToggle';
+const SIG_ATTR = 'data-lp-sig';
+const COUNT_ATTR = 'data-lp-n';
+const BOUND_ATTR = 'data-lp-bound';
+// Marks a self-link whose core `#123` label we swapped back to its address
+// (see showAddress).
+const UNLABELLED_ATTR = 'data-lp-unlabelled';
+const DESC_MAX = 220;
+const HOVER_SHOW_MS = 250;
+const HOVER_HIDE_MS = 300;
+
+// Hover previews need a real pointer. On touch devices links must navigate
+// on first tap, so hidden previews get an explicit tap target instead
+// (see buildPreviewToggle).
+const POINTER_HOVERS =
+    typeof window.matchMedia === 'function' && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+
+// anchor element → { preview, body } for hover lookups. WeakMaps so entries die
+// with their DOM nodes.
+const anchorRegistry = new WeakMap();
+// .Post-body element → its current previews list, so toggle handlers can
+// re-render the post without going through Mithril.
+const bodyRegistry = new WeakMap();
+// Anchors that already carry hover listeners. Separate from BOUND_ATTR:
+// the attribute tracks "currently preview-bearing" (and is recounted by the
+// staleness probe), while listeners can only be attached once per element.
+const hoverListenersAttached = new WeakSet();
+// Unlabelled self-link anchor → the label nodes core rendered into it.
+const savedLabels = new WeakMap();
+
+extend(CommentPost.prototype, 'oncreate', function () {
+    processPreviews(this);
+});
+
+extend(CommentPost.prototype, 'onupdate', function () {
+    processPreviews(this);
+});
+
+extend(CommentPost.prototype, 'onremove', function () {
+    const post = this.attrs && this.attrs.post;
+    if (post && post.id) stopPendingRefresh(post.id());
+});
+
+// ─── Pending → settled ─────────────────────────────────────────────────
+//
+// A card is fetched on the queue after the post is saved, so the author (whose
+// own post comes back from the save) and realtime recipients (who load it the
+// moment it lands) usually receive it with a `pending` skeleton. Nothing ever
+// told the page when the fetch finished: the skeleton sat there until a
+// reload. So a post that arrives with a pending preview is re-requested a few
+// times — the store update redraws it, and the settled card drops into the
+// space the skeleton already reserved.
+//
+// Bounded: offsets from the first sighting, then we stop. A fetch that has
+// not settled after ~45 s is a slow host or a busy queue, and the card will
+// be there on the next page view. One timer per post id at most.
+const PENDING_REFRESH_AT_MS = [5000, 15000, 45000];
+// post id → { key, tries, timer }. `key` is the set of pending URLs the
+// schedule was started for; a new pending URL (an edit) starts a fresh one.
+const pendingRefresh = new Map();
+
+function schedulePendingRefresh(post, list) {
+    const id = post.id && post.id();
+    if (!id) return;
+
+    const pending = list.filter((p) => p && p.pending).map((p) => p.url);
+    if (pending.length === 0) {
+        stopPendingRefresh(id); // settled — nothing left to wait for
+        return;
+    }
+
+    const key = pending.join('\n');
+    const entry = pendingRefresh.get(id);
+    if (entry && entry.key === key) return; // already scheduled, or exhausted
+
+    if (entry) clearTimeout(entry.timer);
+    const next = { key, tries: 0, timer: null };
+    pendingRefresh.set(id, next);
+    armPendingRefresh(id, next);
+}
+
+function armPendingRefresh(id, entry) {
+    if (entry.tries >= PENDING_REFRESH_AT_MS.length) return; // exhausted — keep the entry so we don't restart
+
+    const delay = PENDING_REFRESH_AT_MS[entry.tries] - (entry.tries ? PENDING_REFRESH_AT_MS[entry.tries - 1] : 0);
+
+    entry.timer = setTimeout(() => {
+        entry.timer = null;
+        entry.tries++;
+        if (pendingRefresh.get(id) !== entry) return; // superseded or removed meanwhile
+
+        app.store
+            .find('posts', id)
+            .then(() => m.redraw())
+            .catch(() => {}) // a failed refresh is not worth a user-visible error
+            .then(() => {
+                // Still ours and still pending after the redraw? Go again.
+                if (pendingRefresh.get(id) === entry) armPendingRefresh(id, entry);
+            });
+    }, delay);
+}
+
+function stopPendingRefresh(id) {
+    const entry = pendingRefresh.get(id);
+    if (!entry) return;
+    if (entry.timer) clearTimeout(entry.timer);
+    pendingRefresh.delete(id);
+}
+
+function processPreviews(commentPost) {
+    const post = commentPost.attrs && commentPost.attrs.post;
+    if (!post || !post.attribute) return;
+
+    const previews = post.attribute('linkPreviews');
+    const list = Array.isArray(previews) ? previews : [];
+
+    schedulePendingRefresh(post, list);
+
+    const root = commentPost.element;
+    if (!root) return;
+
+    const body = root.querySelector('.Post-body');
+    if (!body) return;
+
+    // Skip the rebuild when nothing changed. Two staleness signals:
+    //   - sig: preview list + per-preview display state (dismiss/pin from
+    //     another actor while the page is open changes it);
+    //   - bound-anchor count: a post edit makes Mithril reset the body's
+    //     innerHTML, which keeps the element (and its sig attribute!) but
+    //     wipes our injected cards and anchor bindings. Fresh anchors carry
+    //     no BOUND_ATTR, so the count drops and we re-render.
+    const sig = computeSig(list);
+    const bound = body.querySelectorAll('a[' + BOUND_ATTR + ']').length;
+    if (body.getAttribute(SIG_ATTR) === sig && bound === Number(body.getAttribute(COUNT_ATTR) || 0)) return;
+
+    renderBody(body, list);
+    body.setAttribute(SIG_ATTR, sig);
+}
+
+function computeSig(list) {
+    return list
+        .map((e) => `${e.url}|${e.pending ? 'P' : ''}${e.dismissed ? 'd' : ''}${e.pinned ? 'p' : ''}${e.canToggle ? 'm' : ''}`)
+        .join('\n');
+}
+
+/**
+ * (Re)build all cards and hover bindings for one post body.
+ *
+ * Visibility rule per URL:
+ *   - pinned          → inline card (author/mod forced it)
+ *   - dismissed       → no card, hover preview only
+ *   - otherwise       → inline card only if the post contains the URL as a
+ *                       RAW link (text == href). Titled links ([Title](url),
+ *                       [url=...]Title[/url]) are hover-only by default.
+ * The card goes after the first raw occurrence of the URL, or the first
+ * occurrence if there is none.
+ */
+function renderBody(body, list) {
+    bodyRegistry.set(body, list);
+
+    body.querySelectorAll('.' + WRAPPER_CLASS + ', .' + TOGGLE_CLASS).forEach((el) => el.remove());
+    body.querySelectorAll('a[' + UNLABELLED_ATTR + ']').forEach(restoreLabel);
+
+    const byUrl = new Map();
+    for (const preview of list) {
+        if (preview && preview.url) byUrl.set(preview.url, preview);
+    }
+
+    const anchorsByUrl = new Map();
+    let bound = 0;
+
+    for (const anchor of body.querySelectorAll('a[href]')) {
+        if (anchor.closest('.' + WRAPPER_CLASS)) continue; // our own card link
+        const preview = byUrl.get(anchor.getAttribute('href'));
+        if (!preview) {
+            // Lost its preview since the last render (e.g. fetch finished with
+            // no usable metadata). Unmark it so the staleness probe's count
+            // stays in sync and the hover handler goes inert.
+            if (anchor.hasAttribute(BOUND_ATTR)) {
+                anchor.removeAttribute(BOUND_ATTR);
+                anchorRegistry.delete(anchor);
+            }
+            continue;
+        }
+
+        anchorRegistry.set(anchor, { preview, body });
+        anchor.setAttribute(BOUND_ATTR, '1');
+        if (POINTER_HOVERS && !hoverListenersAttached.has(anchor)) {
+            hoverListenersAttached.add(anchor);
+            bindHover(anchor);
+        }
+        bound++;
+
+        const arr = anchorsByUrl.get(preview.url) || [];
+        arr.push(anchor);
+        anchorsByUrl.set(preview.url, arr);
+    }
+
+    body.setAttribute(COUNT_ATTR, String(bound));
+
+    for (const [url, anchors] of anchorsByUrl) {
+        const preview = byUrl.get(url);
+        const rawAnchor = anchors.find(isRawLink);
+
+        const visible = preview.pinned || (!preview.dismissed && !!rawAnchor);
+        const at = rawAnchor || anchors[0];
+
+        if (visible) {
+            showAddress(at);
+            at.parentNode.insertBefore(buildWrapper(preview, body), at.nextSibling);
+        } else if (!POINTER_HOVERS && !preview.pending) {
+            // A pending preview has nothing to show yet — no tap target until the
+            // fetch lands. (A pending RAW link instead gets an inline skeleton
+            // via the `visible` branch above.)
+            // Touch devices have no hover, and hijacking the link's first tap
+            // is the classic iOS double-tap anti-pattern (links must navigate
+            // on first tap). Instead: a small explicit tap target after the
+            // link opens the preview overlay; tapping anywhere else closes it.
+            at.parentNode.insertBefore(buildPreviewToggle(preview, body, at), at.nextSibling);
+        }
+    }
+}
+
+function buildPreviewToggle(preview, body, anchor) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = TOGGLE_CLASS;
+    const label = trans('preview_aria_prefix', 'Link preview');
+    btn.setAttribute('aria-label', `${label}: ${preview.url}`);
+    btn.title = label;
+    const icon = document.createElement('i');
+    icon.className = 'fas fa-eye';
+    icon.setAttribute('aria-hidden', 'true');
+    btn.appendChild(icon);
+    btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (hoverEl && hoverAnchor === anchor) {
+            hideHover(); // second tap on the trigger closes the preview
+        } else {
+            showHover(anchor, preview, body);
+        }
+    });
+    return btn;
+}
+
+/**
+ * A link is "raw" when its visible text is the URL itself (what you get by
+ * pasting a bare URL). Tolerates a missing scheme or trailing slash in the
+ * displayed text. Anything else — Markdown/BBCode titles, image links — is
+ * "titled" and defaults to hover-only.
+ */
+function isRawLink(anchor) {
+    if (isRelabelledDiscussionLink(anchor)) return true;
+
+    const href = (anchor.getAttribute('href') || '').trim();
+    const text = (anchor.textContent || '').trim();
+    if (!href || !text) return false;
+    if (text === href) return true;
+    const norm = (s) => s.replace(/^https?:\/\//i, '').replace(/\/$/, '');
+    return norm(text) === norm(href);
+}
+
+/**
+ * A bare-pasted link to a discussion on this same forum no longer *reads* as a
+ * URL: since core 2.0.0-rc.6 (flarum/framework#4924) the formatter replaces its
+ * text with a `#123` label — favicon, discussion id, and the post number when
+ * the link named a reply. Comparing text to href therefore says "titled" about
+ * a link the writer pasted bare, and self-links quietly lost their cards.
+ *
+ * Core applies this class in exactly the case we mean by "raw": the template
+ * branches on `@discussionid and string(.) = @url`, so a link the writer gave
+ * their own words keeps them and gets only `UrlLink--internal`. The composer
+ * preview mirrors the same rule client-side in `labelDiscussionLinks`.
+ *
+ * Checked before the text comparison because that comparison cannot work here
+ * — the address is gone from the DOM, and the label is all that is left.
+ */
+function isRelabelledDiscussionLink(anchor) {
+    return anchor.classList.contains('UrlLink--discussion');
+}
+
+/**
+ * Show the address again on a relabelled discussion link that has a card.
+ *
+ * Core's `#123` label exists because a bare address says nothing useful; the
+ * card says more than either, so the label beside it only repeats the card in
+ * shorthand. With a card, the link reads as what the writer pasted — the same
+ * as a raw external link with its card. Without one (dismissed, or no preview
+ * at all) core's label stays, since then it is the best thing on offer.
+ *
+ * The label's nodes are kept so `restoreLabel` can put them back when the
+ * card goes away (a dismiss re-renders the body without a Mithril redraw).
+ * `UrlLink--internal` stays: it is what routes the click through the app.
+ */
+function showAddress(anchor) {
+    if (!anchor.classList.contains('UrlLink--discussion')) return;
+
+    savedLabels.set(anchor, Array.from(anchor.childNodes));
+    anchor.setAttribute(UNLABELLED_ATTR, '');
+    anchor.classList.remove('UrlLink--discussion');
+    anchor.textContent = anchor.getAttribute('href');
+}
+
+function restoreLabel(anchor) {
+    const nodes = savedLabels.get(anchor);
+    anchor.removeAttribute(UNLABELLED_ATTR);
+    if (!nodes) return;
+
+    savedLabels.delete(anchor);
+    anchor.replaceChildren(...nodes);
+    anchor.classList.add('UrlLink--discussion');
+}
+
+/**
+ * Does this URL point back at this forum?
+ *
+ * Mirrors the test core makes in `labelDiscussionLinks`: same origin, and
+ * within the forum's base path when it is installed in a subdirectory. Read
+ * off the URL rather than off a class, because the card we build is our own
+ * element and carries no marker from the server.
+ */
+function isInternalUrl(href) {
+    let url;
+
+    try {
+        url = new URL(href, document.baseURI);
+    } catch {
+        return false;
+    }
+
+    if (url.origin !== window.location.origin) return false;
+
+    const basePath = (app.forum && app.forum.attribute('basePath')) || '';
+
+    if (!basePath) return true;
+
+    return url.pathname === basePath || url.pathname.startsWith(basePath + '/');
+}
+
+function findAnchor(body, url) {
+    for (const anchor of body.querySelectorAll('a[href]')) {
+        if (anchor.getAttribute('href') === url && !anchor.closest('.' + WRAPPER_CLASS)) return anchor;
+    }
+    return null;
+}
+
+function findWrapper(body, url) {
+    for (const w of body.querySelectorAll('.' + WRAPPER_CLASS)) {
+        if (w.dataset.lpUrl === url) return w;
+    }
+    return null;
+}
+
+// ─── Inline card ────────────────────────────────────────────────────────
+
+function buildWrapper(preview, body) {
+    // The card itself is the click target; the hide button is layered on
+    // top, with stopPropagation so clicking ✕ doesn't open the link.
+    const wrapper = document.createElement('div');
+    wrapper.className = WRAPPER_CLASS;
+    wrapper.dataset.lpUrl = preview.url;
+
+    if (preview.pending) {
+        // Not fetched yet — reserve the card's footprint with a fixed-size
+        // skeleton so the real card (or its removal, if the fetch yields
+        // nothing usable) doesn't shift the content below. No toggle controls
+        // until the card materializes.
+        wrapper.appendChild(buildSkeleton());
+        return wrapper;
+    }
+
+    wrapper.appendChild(buildCard(preview));
+
+    if (preview.canToggle) {
+        wrapper.appendChild(buildHideButton(preview, body));
+    }
+
+    return wrapper;
+}
+
+// Loading placeholder that mirrors the card's layout (side thumbnail + stacked
+// text lines) so its height closely matches the real card it will become.
+function buildSkeleton() {
+    const card = document.createElement('div');
+    card.className = CARD_CLASS + ' ' + CARD_CLASS + '--skeleton';
+    card.setAttribute('aria-hidden', 'true'); // decorative; SR users skip it
+
+    const img = document.createElement('div');
+    img.className = CARD_CLASS + '-image ' + CARD_CLASS + '-image--skeleton';
+    card.appendChild(img);
+
+    const text = document.createElement('div');
+    text.className = CARD_CLASS + '-text';
+    for (const width of ['38%', '92%', '70%']) {
+        const line = document.createElement('div');
+        line.className = 'LinkPreview-skeleton-line';
+        line.style.width = width;
+        text.appendChild(line);
+    }
+    card.appendChild(text);
+
+    return card;
+}
+
+// Curated so white text clears WCAG AA on every one of them, in both themes —
+// a hue generated from a hash would drift into yellows and greens that white
+// cannot sit on.
+const MARK_COLORS = ['#3F6698', '#63488F', '#985232', '#2C7355', '#A2394A', '#6F6230', '#31596F', '#7F4571'];
+
+// Second-to-last label, so `en.wikipedia.org` gives W rather than E and
+// `bbc.co.uk` gives B rather than C. Not a public-suffix lookup — just the
+// cheap approximation of one, which is all a single letter needs.
+function monogramFor(domain) {
+    const labels = String(domain || '')
+        .toLowerCase()
+        .split('.')
+        .filter(Boolean);
+    if (!labels.length) return null;
+
+    let i = Math.max(0, labels.length - 2);
+    if (i > 0 && ['co', 'com', 'org', 'net', 'ac', 'gov', 'edu'].includes(labels[i])) i--;
+
+    const letter = (labels[i].match(/[a-z0-9]/) || [])[0];
+    return letter ? letter.toUpperCase() : null;
+}
+
+function markColor(domain) {
+    let hash = 0;
+    const s = String(domain || '');
+    for (let i = 0; i < s.length; i++) hash = (hash * 31 + s.charCodeAt(i)) >>> 0;
+    return MARK_COLORS[hash % MARK_COLORS.length];
+}
+
+// Turn an empty slot into a lettered chip. Costs no request and no bytes,
+// which is the whole reason it is preferred over proxying or resizing a
+// source's own icon: a quarter of cards have no icon we can use, and only a
+// fourteenth of those have anything worth resizing.
+function applyMonogram(slot, domain) {
+    const letter = monogramFor(domain);
+    if (!letter) return false;
+    slot.classList.add(CARD_CLASS + '-site-mark--monogram');
+    slot.style.backgroundColor = markColor(domain);
+    slot.textContent = letter;
+    return true;
+}
+
+/**
+ * The 18x18 mark in front of the site name — the forum's own share logo on a
+ * self-link, otherwise the source page's favicon.
+ *
+ * The image sits inside a fixed-size slot rather than being sized itself, so a
+ * favicon that 404s (or that a reader's blocker eats) leaves the box behind
+ * instead of collapsing it. Dropping the <img> and keeping the slot is the
+ * difference between a blank square and every line of the card jumping left
+ * after the card is already on screen.
+ *
+ * Hot-linked, like the thumbnail beside it and for the same reason: proxying a
+ * 1 KB icon while a 200 KB hero image from the same host stays hot-linked would
+ * close nothing. `no-referrer` still applies, so the source host learns nothing
+ * about which discussion the reader is on.
+ */
+function buildSiteMark(src, domain) {
+    const slot = document.createElement('span');
+    slot.className = CARD_CLASS + '-site-mark';
+    slot.setAttribute('aria-hidden', 'true'); // decorative — site name text follows
+
+    // No icon and no letter we could derive: return nothing rather than an
+    // empty box, so a card with no mark keeps its old flush-left site row.
+    if (!src) {
+        return applyMonogram(slot, domain) ? slot : null;
+    }
+
+    const img = document.createElement('img');
+    img.className = CARD_CLASS + '-site-favicon';
+    img.src = src;
+    img.alt = '';
+    img.loading = 'lazy';
+    // An 18px decoration should never compete with the post's own images for
+    // bandwidth or main-thread decode time.
+    img.fetchPriority = 'low';
+    img.decoding = 'async';
+    img.referrerPolicy = 'no-referrer';
+    // A hot-linked icon that 404s or gets blocked leaves the slot standing and
+    // falls back to the letter, so a dead third-party URL degrades to a mark
+    // rather than a blank square. Swapping the contents of a fixed-size box
+    // changes no layout, so this shifts nothing.
+    img.addEventListener(
+        'error',
+        () => {
+            img.remove();
+            applyMonogram(slot, domain);
+        },
+        { once: true }
+    );
+    slot.appendChild(img);
+
+    return slot;
+}
+
+function buildCard(preview) {
+    const card = document.createElement('a');
+    card.className = CARD_CLASS;
+    card.href = preview.finalUrl || preview.url;
+
+    // A card for a link back to this forum is still a link back to this forum,
+    // so it gets what core gives the plain link it stands beside: the same tab,
+    // no `nofollow` telling search engines to ignore the forum's own internal
+    // linking, and the marker class that lets core route the click through the
+    // running application instead of tearing it down and booting it again.
+    // `UrlLink`/`UrlLink--internal` carry no styling of their own — they are
+    // only the marker `routeInternalLinks()` looks for.
+    if (isInternalUrl(card.href)) {
+        card.className += ' UrlLink UrlLink--internal';
+        card.target = '_self';
+        card.rel = 'noopener';
+    } else {
+        card.target = '_blank';
+        card.rel = 'nofollow noopener noreferrer';
+    }
+
+    // Screen readers: collapse the multi-div content into a single descriptive
+    // accessible name. Without this they announce site / title / desc as three
+    // separate text nodes (verbose); with aria-label they read it as one link.
+    const byline = replyByline(preview.reply);
+    const labelParts = [
+        preview.siteName || preview.domain,
+        preview.title,
+        byline,
+        preview.description ? truncate(preview.description, DESC_MAX) : null,
+    ].filter(Boolean);
+    const previewLabel = trans('preview_aria_prefix', 'Link preview');
+    card.setAttribute('aria-label', `${previewLabel}: ${labelParts.join(' — ')}`);
+
+    // The server decides which slot a picture belongs in: a brand mark (the
+    // forum's share logo on a self-link, or a site whose og:image is its own
+    // favicon) arrives as `favicon` with no `image`, so the card renders in
+    // its compact form. A real content thumbnail arrives as `image`.
+    const siteMark = preview.favicon;
+
+    if (preview.image) {
+        // Declared smaller than the phone banner: keep the compact row layout
+        // rather than upscaling it to full width. Decided server-side so it
+        // applies at first paint — discovering it on load would mean changing
+        // the card's shape after it is already on screen.
+        if (preview.imageSmall) card.classList.add(CARD_CLASS + '--compact');
+
+        const img = document.createElement('img');
+        img.className = CARD_CLASS + '-image';
+        img.src = preview.image;
+        img.alt = ''; // decorative — text content provides the info
+        img.loading = 'lazy';
+        img.referrerPolicy = 'no-referrer';
+        // On a phone the thumbnail is a full-width 1.91:1 banner, which crops
+        // the top and bottom off anything squarer than that — and 43% of the
+        // images whose dimensions we can see are square or portrait. Switching
+        // this one to `contain` letterboxes it whole instead. Deliberately done
+        // on load rather than up front: `object-fit` never affects layout, so
+        // the box keeps its reserved size and nothing shifts.
+        img.addEventListener(
+            'load',
+            () => {
+                if (img.naturalWidth && img.naturalHeight / img.naturalWidth > 1 / WIDE_RATIO) {
+                    img.classList.add(CARD_CLASS + '-image--letterbox');
+                }
+            },
+            { once: true }
+        );
+        img.addEventListener(
+            'error',
+            () => {
+                const ph = document.createElement('div');
+                ph.className = CARD_CLASS + '-image ' + CARD_CLASS + '-image--missing';
+                ph.setAttribute('aria-hidden', 'true'); // empty placeholder; screen readers ignore
+                img.replaceWith(ph);
+            },
+            { once: true }
+        );
+        card.appendChild(img);
+    }
+
+    const text = document.createElement('div');
+    text.className = CARD_CLASS + '-text';
+
+    const site = document.createElement('div');
+    site.className = CARD_CLASS + '-site';
+    // The switch that hides site icons hides the monogram too — it is a site
+    // mark either way. Read at render time, since initializers run before
+    // `app.forum` exists.
+    const marksOn = !app.forum || app.forum.attribute('ekumanovLinkPreviewSiteMarks') !== false;
+    if (marksOn) {
+        const mark = buildSiteMark(siteMark, preview.domain);
+        if (mark) site.appendChild(mark);
+    }
+    const siteLabel = document.createElement('span');
+    siteLabel.textContent = preview.siteName || preview.domain || '';
+    site.appendChild(siteLabel);
+    text.appendChild(site);
+
+    const title = document.createElement('div');
+    title.className = CARD_CLASS + '-title';
+    title.textContent = preview.title;
+    text.appendChild(title);
+
+    // A link to a particular reply: the title stays the discussion's, and this
+    // line says whose reply the excerpt below is. Same comment icon core puts
+    // on its `#123 💬45` label, so the two read as the same kind of thing.
+    if (byline) {
+        const meta = document.createElement('div');
+        meta.className = CARD_CLASS + '-reply';
+        const icon = document.createElement('i');
+        icon.className = 'icon fas fa-comment';
+        icon.setAttribute('aria-hidden', 'true');
+        meta.appendChild(icon);
+        const who = document.createElement('span');
+        who.textContent = byline;
+        meta.appendChild(who);
+        text.appendChild(meta);
+    }
+
+    if (preview.description) {
+        const desc = document.createElement('div');
+        desc.className = CARD_CLASS + '-desc';
+        desc.textContent = truncate(preview.description, DESC_MAX);
+        text.appendChild(desc);
+    }
+
+    card.appendChild(text);
+    return card;
+}
+
+function buildHideButton(preview, body) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = CARD_CLASS + '-dismiss';
+    // The visible glyph is `×` but screen readers should hear "Hide preview"
+    // — pair an aria-hidden glyph with an accessible label.
+    const label = trans('hide_preview', 'Hide preview');
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
+    const glyph = document.createElement('span');
+    glyph.setAttribute('aria-hidden', 'true');
+    glyph.textContent = '×';
+    btn.appendChild(glyph);
+    btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        btn.disabled = true;
+        sendToggle(preview, 'dismiss')
+            .then(() => {
+                preview.dismissed = true;
+                preview.pinned = false;
+                refreshBody(body);
+                // Keep keyboard/screen-reader users anchored: focus the link
+                // whose card just collapsed.
+                const anchor = findAnchor(body, preview.url);
+                if (anchor) anchor.focus();
+            })
+            .catch(() => {
+                btn.disabled = false;
+            });
+    });
+    return btn;
+}
+
+// Re-render a post body after a state change and refresh the sig so the
+// next Mithril onupdate doesn't redo the work.
+function refreshBody(body) {
+    const list = bodyRegistry.get(body) || [];
+    renderBody(body, list);
+    body.setAttribute(SIG_ATTR, computeSig(list));
+}
+
+// ─── Hover preview overlay ──────────────────────────────────────────────
+//
+// One singleton, appended to document.body (so no post-body overflow or
+// stacking context can clip it), positioned in page coordinates next to the
+// hovered link. Shown for any preview-bearing link that doesn't currently have
+// its inline card right after it; carries the "Show preview in post" action
+// for actors with edit permission.
+
+let hoverEl = null;
+let hoverAnchor = null;
+let showTimer = 0;
+let hideTimer = 0;
+let globalHoverHandlersBound = false;
+
+function bindHover(anchor) {
+    anchor.addEventListener('mouseenter', () => {
+        const reg = anchorRegistry.get(anchor);
+        if (!reg) return;
+        if (reg.preview.pending) return; // not fetched yet — nothing to preview
+        // Inline card directly after the link → nothing to preview.
+        const next = anchor.nextElementSibling;
+        if (next && next.classList.contains(WRAPPER_CLASS)) return;
+
+        window.clearTimeout(hideTimer);
+        if (hoverAnchor === anchor && hoverEl) return; // already showing this one
+        window.clearTimeout(showTimer);
+        showTimer = window.setTimeout(() => showHover(anchor, reg.preview, reg.body), HOVER_SHOW_MS);
+    });
+    anchor.addEventListener('mouseleave', () => {
+        window.clearTimeout(showTimer);
+        scheduleHide();
+    });
+}
+
+function scheduleHide() {
+    window.clearTimeout(hideTimer);
+    hideTimer = window.setTimeout(hideHover, HOVER_HIDE_MS);
+}
+
+function hideHover() {
+    window.clearTimeout(showTimer);
+    window.clearTimeout(hideTimer);
+    if (hoverEl) {
+        hoverEl.remove();
+        hoverEl = null;
+        hoverAnchor = null;
+    }
+}
+
+function showHover(anchor, preview, body) {
+    hideHover();
+    if (!document.contains(anchor)) return;
+
+    bindGlobalHoverHandlers();
+
+    const el = document.createElement('div');
+    el.className = HOVER_CLASS;
+    el.appendChild(buildCard(preview));
+
+    // The pin action lives here (not as a permanent placeholder in the post
+    // body): visible only to author/mods, and only while no inline card for
+    // this URL exists in the post.
+    if (preview.canToggle && !findWrapper(body, preview.url)) {
+        const actions = document.createElement('div');
+        actions.className = HOVER_CLASS + '-actions';
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = HOVER_CLASS + '-pin';
+        const label = trans('pin_preview', 'Pin preview');
+        btn.textContent = label;
+        btn.setAttribute('aria-label', `${label}: ${preview.url}`);
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            btn.disabled = true;
+            sendToggle(preview, 'pin')
+                .then(() => {
+                    preview.pinned = true;
+                    preview.dismissed = false;
+                    hideHover();
+                    refreshBody(body);
+                    // Move focus to the freshly pinned card.
+                    const wrapper = findWrapper(body, preview.url);
+                    const cardLink = wrapper && wrapper.querySelector('.' + CARD_CLASS);
+                    if (cardLink) cardLink.focus();
+                })
+                .catch(() => {
+                    btn.disabled = false;
+                });
+        });
+
+        actions.appendChild(btn);
+        el.appendChild(actions);
+    }
+
+    el.addEventListener('mouseenter', () => window.clearTimeout(hideTimer));
+    el.addEventListener('mouseleave', scheduleHide);
+
+    document.body.appendChild(el);
+    positionHover(el, anchor);
+
+    hoverEl = el;
+    hoverAnchor = anchor;
+}
+
+function positionHover(el, anchor) {
+    const margin = 8; // viewport edge clearance
+    const gap = 6; // distance from the link
+    const rect = anchor.getBoundingClientRect();
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+
+    let left = rect.left + window.scrollX;
+    const maxLeft = window.scrollX + document.documentElement.clientWidth - w - margin;
+    if (left > maxLeft) left = Math.max(window.scrollX + margin, maxLeft);
+
+    // Below the link by default; above when it wouldn't fit the viewport but
+    // there's room on top.
+    let top = rect.bottom + window.scrollY + gap;
+    if (rect.bottom + gap + h > window.innerHeight && rect.top - gap - h > 0) {
+        top = rect.top + window.scrollY - gap - h;
+    }
+
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+}
+
+function bindGlobalHoverHandlers() {
+    if (globalHoverHandlersBound) return;
+    globalHoverHandlersBound = true;
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') hideHover();
+    });
+    // Capture-phase: also fires for clicks that trigger SPA navigation, so
+    // the overlay never survives onto another page. Preview-toggle buttons
+    // are exempt — their own handler decides between toggle-off and
+    // switching the overlay to another link.
+    document.addEventListener(
+        'click',
+        (e) => {
+            const onToggle = e.target.closest && e.target.closest('.' + TOGGLE_CLASS);
+            // A card that opens in this tab takes the page with it, so the
+            // overlay has to go too — it is positioned against an anchor that
+            // is about to be replaced. Cards opening a new tab leave this page
+            // standing, and the overlay with it.
+            const leavingCard = e.target.closest && e.target.closest('.' + CARD_CLASS + '[target="_self"]');
+            if (hoverEl && (!hoverEl.contains(e.target) || leavingCard) && !onToggle) hideHover();
+        },
+        true
+    );
+}
+
+// ─── Shared helpers ─────────────────────────────────────────────────────
+
+function sendToggle(preview, action) {
+    return app.request({
+        method: 'POST',
+        url: `${app.forum.attribute('apiUrl')}/link-previews/posts/${preview.postId}/previews/${preview.previewId}/${action}`,
+    });
+}
+
+/**
+ * "Author · 3 Oct" for a reply card, or null. The author is missing when the
+ * account was deleted; the date then stands alone.
+ */
+function replyByline(reply) {
+    if (!reply) return null;
+
+    const parts = [];
+    if (reply.author) parts.push(reply.author);
+    if (reply.time) parts.push(humanTime(reply.time));
+
+    return parts.length ? parts.join(' · ') : null;
+}
+
+function trans(key, fallback) {
+    const out = app.translator.trans(`ekumanov-link-preview.forum.${key}`);
+    const s = typeof out === 'string' ? out : Array.isArray(out) ? out.join('') : '';
+    return s || fallback;
+}
+
+function truncate(s, max) {
+    if (!s) return '';
+    const trimmed = s.trim();
+    if (trimmed.length <= max) return trimmed;
+    return trimmed.slice(0, max - 1).replace(/\s+\S*$/, '') + '…';
+}
